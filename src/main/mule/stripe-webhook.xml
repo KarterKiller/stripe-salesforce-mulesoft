@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <flow name="stripe-webhook-flow">
+
+        <!-- 1. Recevoir le webhook Stripe -->
+        <http:listener
+            config-ref="HTTP_Listener_config"
+            path="/webhook/stripe"
+            doc:name="Receive Stripe Webhook"
+            allowedMethods="POST">
+            <http:response statusCode="#[vars.httpStatus default 200]"/>
+        </http:listener>
+
+        <!-- 2. Sauvegarder le header Stripe-Signature -->
+        <set-variable
+            variableName="stripeSignature"
+            value="#[attributes.headers['Stripe-Signature']]"
+            doc:name="Save Stripe Signature"/>
+
+        <!-- 3. Validation structurelle de la signature -->
+        <set-variable
+            variableName="isValidSignature"
+            value="#[
+                output application/java
+                import * from dw::core::Strings
+                var sig = vars.stripeSignature default ''
+                var parts = sig splitBy ','
+                var timestamp = (parts filter ($ startsWith 't='))[0] replace 't=' with ''
+                var v1 = (parts filter ($ startsWith 'v1='))[0] replace 'v1=' with ''
+                ---
+                (sizeOf(timestamp) > 0) and (sizeOf(v1) == 64)
+            ]"
+            doc:name="Validate Signature Structure"/>
+
+        <!-- 4. Rejeter si signature invalide -->
+        <choice doc:name="Signature Valid?">
+            <when expression="#[vars.isValidSignature == false]">
+                <logger
+                    level="INFO"
+                    message="#[output application/java --- 'SIGNATURE INVALIDE | sig: ' ++ (vars.stripeSignature default 'null')]"
+                    doc:name="Log Invalid Signature"/>
+                <set-payload value='#["Unauthorized"]' doc:name="Set 401"/>
+                <set-variable variableName="httpStatus" value="401" doc:name="Set Status 401"/>
+            </when>
+            <otherwise>
+    <!-- 5. Filtrer uniquement checkout.session.completed -->
+    <choice doc:name="Filter Event Type">
+        <when expression="#[payload.'type' == 'checkout.session.completed']">
+            <logger
+                level="INFO"
+                message="#[output application/java --- 'checkout.session.completed reçu - session: ' ++ payload.data.object.id]"
+                doc:name="Log Checkout Session"/>
+                
+           
+            <flow-ref name="process-checkout-session-flow" doc:name="Process Checkout Session"/>
+            
+        </when>
+        <otherwise>
+            <logger
+                level="INFO"
+                message="#[output application/java --- 'Événement ignoré: ' ++ (payload.'type' default 'unknown')]"
+                doc:name="Log Ignored Event"/>
+        </otherwise>
+    </choice>
+
+    <!-- 6. Retourner 200 -->
+    <set-payload value='#["OK"]' doc:name="Set Response OK"/>
+</otherwise>
+        </choice>
+
+    <error-handler>
+            <on-error-propagate type="ANY" doc:name="Handle Any Error">
+                <logger
+                    level="ERROR"
+                    message="#[output application/java --- 'ERREUR webhook: ' ++ (error.description default 'unknown') ++ ' | cause: ' ++ (error.cause.message default 'none')]"
+                    doc:name="Log Error"/>
+                <set-payload value='#["Internal Server Error"]' doc:name="Set 500 Payload"/>
+                <set-variable variableName="httpStatus" value="500" doc:name="Set Status 500"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+</mule>

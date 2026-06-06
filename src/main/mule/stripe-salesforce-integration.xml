@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/salesforce
+        http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <sub-flow name="process-checkout-session-flow">
+
+        <!-- 1. Extraire les données de la session Stripe -->
+        <ee:transform doc:name="Extract Session Data">
+            <ee:variables>
+                <ee:set-variable variableName="sessionId"><![CDATA[%dw 2.0
+output application/java
+---
+payload.data.object.id]]></ee:set-variable>
+                <ee:set-variable variableName="customerEmail"><![CDATA[%dw 2.0
+output application/java
+---
+payload.data.object.customer_details.email default 'unknown@unknown.com']]></ee:set-variable>
+                <ee:set-variable variableName="customerName"><![CDATA[%dw 2.0
+output application/java
+---
+payload.data.object.customer_details.name default 'Unknown']]></ee:set-variable>
+                <ee:set-variable variableName="amount"><![CDATA[%dw 2.0
+output application/java
+---
+(payload.data.object.amount_total default 0) / 100]]></ee:set-variable>
+                <ee:set-variable variableName="currency"><![CDATA[%dw 2.0
+output application/java
+---
+upper(payload.data.object.currency default 'USD')]]></ee:set-variable>
+                <ee:set-variable variableName="customerId"><![CDATA[%dw 2.0
+output application/java
+---
+payload.data.object.customer
+default ('cus_test_' ++ payload.data.object.id)]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <logger
+            level="INFO"
+            message="#[output application/java --- 'Processing session: ' ++ vars.sessionId ++ ' | customer: ' ++ vars.customerEmail ++ ' | amount: ' ++ (vars.amount as String) ++ ' ' ++ vars.currency]"
+            doc:name="Log Session Data"/>
+
+        <!-- 2. Vérifier idempotence -->
+        <salesforce:query
+            config-ref="Salesforce_Config"
+            doc:name="Check Existing Payment">
+            <salesforce:salesforce-query>SELECT Id FROM Payment__c WHERE Stripe_Session_ID__c = ':sessionId'</salesforce:salesforce-query>
+            <salesforce:parameters><![CDATA[#[output application/java --- {sessionId: vars.sessionId}]]]></salesforce:parameters>
+        </salesforce:query>
+
+        <!-- 3. Si déjà traité, ignorer -->
+        <choice doc:name="Already Processed?">
+            <when expression="#[sizeOf(payload) > 0]">
+                <logger
+                    level="INFO"
+                    message="#[output application/java --- 'Event déjà traité, session: ' ++ vars.sessionId]"
+                    doc:name="Log Duplicate"/>
+            </when>
+            <otherwise>
+                <flow-ref name="process-payment-flow" doc:name="Process Payment"/>
+            </otherwise>
+        </choice>
+
+    </sub-flow>
+
+    <sub-flow name="process-payment-flow">
+
+        <!-- 1. Upsert Account -->
+        <salesforce:upsert
+            config-ref="Salesforce_Config"
+            externalIdFieldName="Stripe_Customer_ID__c"
+            objectType="Account"
+            doc:name="Upsert Account">
+            <salesforce:records><![CDATA[#[[{
+                "Name": vars.customerName,
+                "Stripe_Customer_ID__c": vars.customerId
+            }]]]]></salesforce:records>
+        </salesforce:upsert>
+
+        <set-variable
+            variableName="accountUpsertResult"
+            value="#[payload]"
+            doc:name="Save Account Result"/>
+
+        <logger
+            level="INFO"
+            message="#[output application/java --- 'Account upsert result: ' ++ write(vars.accountUpsertResult, 'application/json')]"
+            doc:name="Log Account Result"/>
+
+        <!-- 2. Upsert Opportunity Closed Won -->
+        <salesforce:upsert
+            config-ref="Salesforce_Config"
+            externalIdFieldName="Stripe_Session_ID__c"
+            objectType="Opportunity"
+            doc:name="Upsert Opportunity">
+            <salesforce:records><![CDATA[#[[{
+                "Name": "Payment - " ++ vars.customerName,
+                "Stripe_Session_ID__c": vars.sessionId,
+                "StageName": "Closed Won",
+                "CloseDate": now() as Date,
+                "Amount": vars.amount
+            }]]]]></salesforce:records>
+        </salesforce:upsert>
+
+        <set-variable
+            variableName="opportunityUpsertResult"
+            value="#[payload]"
+            doc:name="Save Opportunity Result"/>
+
+        <logger
+            level="INFO"
+            message="#[output application/java --- 'Opportunity upsert result: ' ++ write(vars.opportunityUpsertResult, 'application/json')]"
+            doc:name="Log Opportunity Result"/>
+
+        <!-- 3. Insert Payment__c -->
+        <set-variable
+            variableName="opportunityId"
+            value="#[vars.opportunityUpsertResult.items[0].id]"
+            doc:name="Save Opportunity ID"/>
+
+        <set-variable
+            variableName="accountId"
+            value="#[vars.accountUpsertResult.items[0].id]"
+            doc:name="Save Account ID"/>
+
+        <salesforce:create
+            config-ref="Salesforce_Config"
+            type="Payment__c"
+            doc:name="Insert Payment">
+            <salesforce:records><![CDATA[#[[{
+                "Stripe_Session_ID__c": vars.sessionId,
+                "Amount__c": vars.amount,
+                "Currency__c": vars.currency,
+                "Status__c": "Succeeded",
+                "Opportunity__c": vars.opportunityId,
+                "Account__c": vars.accountId
+            }]]]]></salesforce:records>
+        </salesforce:create>
+
+        <logger
+            level="INFO"
+            message="#[output application/java --- 'Payment__c insert result: ' ++ write(payload, 'application/json')]"
+            doc:name="Log Payment Result"/>
+
+    </sub-flow>
+
+</mule>

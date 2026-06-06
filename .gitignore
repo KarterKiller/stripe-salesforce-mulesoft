@@ -1,0 +1,29 @@
+# Credentials et config sensible
+src/main/resources/config.yaml
+src/main/resources/local.yaml
+
+# Mule
+target/
+.mule/
+*.jar
+
+# Anypoint Studio
+.classpath
+.project
+.settings/
+.factorypath
+
+# Maven
+.mvn/
+mvnw
+mvnw.cmd
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+*.swp
+*.swo
+.idea/
+*.iml
